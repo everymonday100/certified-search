@@ -16,28 +16,28 @@
 static const slong PREC = 128;
 
 // ---- rigorous double extraction helpers ----
-static double arb_lo_floor(const arb_t x) {  // <= true lower bound
+static double arb_lo_floor(const arb_t x) {
     arf_t t; arf_init(t);
     arb_get_lbound_arf(t, x, PREC);
     double d = arf_get_d(t, ARF_RND_FLOOR);
     arf_clear(t);
     return d;
 }
-static double arb_hi_ceil(const arb_t x) {  // >= true upper bound
+static double arb_hi_ceil(const arb_t x) {
     arf_t t; arf_init(t);
     arb_get_ubound_arf(t, x, PREC);
     double d = arf_get_d(t, ARF_RND_CEIL);
     arf_clear(t);
     return d;
 }
-static double arb_lo_ceil(const arb_t x) {  // >= true lower bound
+static double arb_lo_ceil(const arb_t x) {
     arf_t t; arf_init(t);
     arb_get_lbound_arf(t, x, PREC);
     double d = arf_get_d(t, ARF_RND_CEIL);
     arf_clear(t);
     return d;
 }
-static double arb_hi_floor(const arb_t x) {  // <= true upper bound
+static double arb_hi_floor(const arb_t x) {
     arf_t t; arf_init(t);
     arb_get_ubound_arf(t, x, PREC);
     double d = arf_get_d(t, ARF_RND_FLOOR);
@@ -93,15 +93,22 @@ static bool gauge_transform(std::vector<double>& p, int n) {
 }
 
 static std::vector<int> slice_indices(int n) {
-    std::vector<int> idx = {3, 4, 5};
+    std::vector<int> idx;
+    idx.push_back(3);  // x1 only (y1=0, z1=0 fixed by gauge)
+    idx.push_back(6);  // x2
+    idx.push_back(7);  // y2 (z2=0 fixed by gauge)
     for (int i = 3; i < n; ++i) { idx.push_back(3*i); idx.push_back(3*i+1); idx.push_back(3*i+2); }
-    return idx;  // size 3N-6
+    return idx;  // size 1 + 2 + (n-3)*3 = 3N-6
 }
 
 static void full_from_q(const std::vector<double>& q0, int n, std::vector<double>& full) {
     full.assign(3*n, 0.0);
-    full[3] = q0[0];
-    full[4] = q0[1]; full[5] = q0[2];
+    // atom 0: (0,0,0) - already zero
+    full[3] = q0[0];  // x1
+    // atom 1: y1=0, z1=0 - already zero
+    full[6] = q0[1];  // x2
+    full[7] = q0[2];  // y2
+    // atom 2: z2=0 - already zero
     for (int i = 3; i < n; ++i)
         for (int c = 0; c < 3; ++c) full[3*i+c] = q0[3 + 3*(i-3) + c];
 }
@@ -144,12 +151,12 @@ static bool invert_mat(const std::vector<double>& A0, std::vector<double>& Ainv,
 static void lj_interval_grad_hess(const std::vector<arb_t>& cart, int n,
                                   std::vector<arb_t>& grad, std::vector<arb_t>& hess,
                                   arb_t eout, double* dmin_lb) {
-    arb_t dx, dy, dz, r2, i1, i2, i4, i5, i6, i7, i8, r6i, t1, t2, A, B, val, cb;
-    arb_t c4, cm12, c6, c168, cm48, zb, ob, rr[3];
+    arb_t dx, dy, dz, r2, i1, i2, i4, i5, i6, i7, i8, r6i, t1, t2, A, B, val;
+    arb_t c4, cm12, c6, c168, cm48, zb, ob;
     arb_init(dx); arb_init(dy); arb_init(dz); arb_init(r2);
     arb_init(i1); arb_init(i2); arb_init(i4); arb_init(i5); arb_init(i6);
     arb_init(i7); arb_init(i8); arb_init(r6i);
-    arb_init(t1); arb_init(t2); arb_init(A); arb_init(B); arb_init(val); arb_init(cb);
+    arb_init(t1); arb_init(t2); arb_init(A); arb_init(B); arb_init(val);
     arb_init(c4); arb_init(cm12); arb_init(c6); arb_init(c168); arb_init(cm48);
     arb_init(zb); arb_init(ob);
     arb_set_d(c4, 4.0); arb_set_d(cm12, -12.0); arb_set_d(c6, 6.0);
@@ -178,10 +185,10 @@ static void lj_interval_grad_hess(const std::vector<arb_t>& cart, int n,
             arb_sqr(i2, i1, PREC);
             arb_sqr(i4, i2, PREC);
             arb_mul(i5, i4, i1, PREC);
-            arb_mul(i6, i4, i2, PREC);   // r2^-6 = r^-12
+            arb_mul(i6, i4, i2, PREC);
             arb_mul(i7, i6, i1, PREC);
             arb_sqr(i8, i4, PREC);
-            arb_mul(r6i, i1, i2, PREC);  // r2^-3 = r^-6
+            arb_mul(r6i, i1, i2, PREC);
 
             arb_mul(t1, i7, cm12, PREC);
             arb_mul(t2, i4, c6, PREC);
@@ -193,7 +200,12 @@ static void lj_interval_grad_hess(const std::vector<arb_t>& cart, int n,
             arb_add(B, t1, t2, PREC);
             arb_mul(B, B, c4, PREC);
 
-            rr[0] = dx; rr[1] = dy; rr[2] = dz;
+            arb_t rr[3];
+            arb_init(rr[0]); arb_init(rr[1]); arb_init(rr[2]);
+            arb_set(rr[0], dx);
+            arb_set(rr[1], dy);
+            arb_set(rr[2], dz);
+
             for (int c = 0; c < 3; ++c) {
                 arb_mul(val, A, rr[c], PREC);
                 arb_add(grad[3*i+c], grad[3*i+c], val, PREC);
@@ -211,6 +223,9 @@ static void lj_interval_grad_hess(const std::vector<arb_t>& cart, int n,
                     arb_sub(hess[(3*j+a)*(3*n) + (3*i+b)], hess[(3*j+a)*(3*n) + (3*i+b)], val, PREC);
                 }
             }
+            
+            arb_clear(rr[0]); arb_clear(rr[1]); arb_clear(rr[2]);
+
             arb_mul(t1, i6, c4, PREC);
             arb_mul(t2, r6i, c4, PREC);
             arb_sub(t1, t1, t2, PREC);
@@ -220,7 +235,7 @@ static void lj_interval_grad_hess(const std::vector<arb_t>& cart, int n,
     arb_clear(dx); arb_clear(dy); arb_clear(dz); arb_clear(r2);
     arb_clear(i1); arb_clear(i2); arb_clear(i4); arb_clear(i5); arb_clear(i6);
     arb_clear(i7); arb_clear(i8); arb_clear(r6i);
-    arb_clear(t1); arb_clear(t2); arb_clear(A); arb_clear(B); arb_clear(val); arb_clear(cb);
+    arb_clear(t1); arb_clear(t2); arb_clear(A); arb_clear(B); arb_clear(val);
     arb_clear(c4); arb_clear(cm12); arb_clear(c6); arb_clear(c168); arb_clear(cm48);
     arb_clear(zb); arb_clear(ob);
 }
@@ -238,11 +253,12 @@ int main(int argc, char** argv) {
     int m = (int)idx.size();
 
     std::vector<double> q0(m);
-    q0[0] = p[3]; q0[1] = p[4]; q0[2] = p[5];
+    q0[0] = p[3];  // x1
+    q0[1] = p[6];  // x2
+    q0[2] = p[7];  // y2
     for (int i = 3; i < n; ++i)
         for (int c = 0; c < 3; ++c) q0[3 + 3*(i-3) + c] = p[3*i+c];
 
-    // float Newton refinement on the slice (not proof-bearing)
     double ginf = 1e300;
     for (int iter = 0; iter < 6; ++iter) {
         std::vector<double> full;
@@ -263,7 +279,6 @@ int main(int argc, char** argv) {
     }
     std::cout << "[newton] |grad|_inf after refine = " << ginf << "\n";
 
-    // ---- interval stage ----
     mag_t radmag; mag_init(radmag); mag_set_d(radmag, rad);
 
     std::vector<arb_t> qp(m), qX(m), cartp(3*n), cartX(3*n);
@@ -277,12 +292,11 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 3*n; ++i) { arb_init(cartp[i]); arb_init(cartX[i]); arb_init(gradp[i]); arb_init(gradX[i]); }
     for (size_t i = 0; i < hessX.size(); ++i) arb_init(hessX[i]);
 
-    // point carts
     arb_set_d(cartp[0], 0.0); arb_set_d(cartp[1], 0.0); arb_set_d(cartp[2], 0.0);
     arb_set(cartp[3], qp[0]); arb_set_d(cartp[4], 0.0); arb_set_d(cartp[5], 0.0);
     arb_set(cartp[6], qp[1]); arb_set(cartp[7], qp[2]); arb_set_d(cartp[8], 0.0);
     for (int i = 3; i < n; ++i) for (int c = 0; c < 3; ++c) arb_set(cartp[3*i+c], qp[3+3*(i-3)+c]);
-    // box carts
+    
     arb_set_d(cartX[0], 0.0); arb_set_d(cartX[1], 0.0); arb_set_d(cartX[2], 0.0);
     arb_set(cartX[3], qX[0]); arb_set_d(cartX[4], 0.0); arb_set_d(cartX[5], 0.0);
     arb_set(cartX[6], qX[1]); arb_set(cartX[7], qX[2]); arb_set_d(cartX[8], 0.0);
@@ -292,12 +306,10 @@ int main(int argc, char** argv) {
     arb_init(ep); arb_init(eX);
     arb_set_d(ep, 0.0); arb_set_d(eX, 0.0);
     double dmin = 1e300;
-    lj_interval_grad_hess(cartp, n, gradp, hessX, ep, nullptr);   // hess at point unused
-    // re-init hessX for box pass
+    lj_interval_grad_hess(cartp, n, gradp, hessX, ep, nullptr);
     for (size_t i = 0; i < hessX.size(); ++i) arb_set_d(hessX[i], 0.0);
     lj_interval_grad_hess(cartX, n, gradX, hessX, eX, &dmin);
 
-    // select F0 and H(X)
     std::vector<arb_t> F0(m), HX(m*m);
     for (int i = 0; i < m; ++i) arb_init(F0[i]);
     for (int i = 0; i < m*m; ++i) arb_init(HX[i]);
@@ -305,7 +317,6 @@ int main(int argc, char** argv) {
     for (int a = 0; a < m; ++a)
         for (int b = 0; b < m; ++b) arb_set(HX[a*m+b], hessX[(size_t)idx[a]*(3*n) + idx[b]]);
 
-    // preconditioner C = inv(mid Hessian at q0)  (float, not proof-bearing)
     std::vector<double> full;
     full_from_q(q0, n, full);
     LJResult rf = compute_lj_exact(full);
@@ -314,7 +325,6 @@ int main(int argc, char** argv) {
         for (int b = 0; b < m; ++b) Hsel[a*m+b] = rf.hessian[(size_t)idx[a]*(3*n) + idx[b]];
     if (!invert_mat(Hsel, C, m)) { std::cerr << "preconditioner inversion failed\n"; return 2; }
 
-    // M = I - C*H(X)
     std::vector<arb_t> M(m*m);
     for (int i = 0; i < m*m; ++i) arb_init(M[i]);
     {
@@ -335,7 +345,6 @@ int main(int argc, char** argv) {
         arb_clear(acc); arb_clear(t); arb_clear(cb2); arb_clear(db);
     }
 
-    // kappa = ||M||_inf upper bound
     double kappa = 0.0;
     {
         arb_t S, t;
@@ -343,7 +352,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < m; ++i) {
             arb_set_d(S, 0.0);
             for (int j = 0; j < m; ++j) {
-                arb_abs(t, M[i*m+j], PREC);
+                arb_abs(t, M[i*m+j]);
                 arb_add(S, S, t, PREC);
             }
             kappa = std::max(kappa, arb_hi_ceil(S));
@@ -351,37 +360,28 @@ int main(int argc, char** argv) {
         arb_clear(S); arb_clear(t);
     }
 
-    // K = q0 - C*F0 + M*(X - q0)
     std::vector<arb_t> K(m), V(m);
     for (int i = 0; i < m; ++i) { arb_init(K[i]); arb_init(V[i]); arb_set_d(V[i], 0.0); arb_add_error_mag(V[i], radmag); }
     {
-        arb_t t, cb2;
-        arb_init(t); arb_init(cb2);
+        arb_t t, cb2, cf;
+        arb_init(t); arb_init(cb2); arb_init(cf);
         for (int i = 0; i < m; ++i) {
             arb_set_d(K[i], q0[i]);
-            arb_set_d(t, 0.0);
-            for (int k = 0; k < m; ++k) {
-                arb_set_d(cb2, C[i*m+k]);
-                arb_mul(t, t, cb2, PREC);  // placeholder to keep cb2 used
-            }
-            // CF0_i
-            arb_t cf; arb_init(cf); arb_set_d(cf, 0.0);
+            arb_set_d(cf, 0.0);
             for (int k = 0; k < m; ++k) {
                 arb_set_d(cb2, C[i*m+k]);
                 arb_mul(t, cb2, F0[k], PREC);
                 arb_add(cf, cf, t, PREC);
             }
             arb_sub(K[i], K[i], cf, PREC);
-            arb_clear(cf);
             for (int j = 0; j < m; ++j) {
                 arb_mul(t, M[i*m+j], V[j], PREC);
                 arb_add(K[i], K[i], t, PREC);
             }
         }
-        arb_clear(t); arb_clear(cb2);
+        arb_clear(t); arb_clear(cb2); arb_clear(cf);
     }
 
-    // inclusion K ⊂ int(X)
     bool incl = true;
     for (int i = 0; i < m && incl; ++i) {
         double klo = arb_lo_floor(K[i]), khi = arb_hi_ceil(K[i]);
@@ -389,7 +389,6 @@ int main(int argc, char** argv) {
         if (!(klo > xlo) || !(khi < xhi)) incl = false;
     }
 
-    // interval Cholesky => PD for all H in H(X)
     bool pd = true;
     double pd_lb = 1e300;
     std::vector<arb_t> L(m*m);
