@@ -241,13 +241,24 @@ static void lj_interval_grad_hess(const std::vector<arb_t>& cart, int n,
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::cerr << "usage: krawczyk_lj13 <xyz> <radius_exp>\n"; return 2; }
-    int n = 0;
-    std::vector<double> p;
-    if (!read_xyz(argv[1], p, n)) return 2;
-    if (n != 13) { std::cerr << "prototype: N=13 only\n"; return 2; }
-    double rad = std::pow(10.0, -std::atof(argv[2]));
-    if (!gauge_transform(p, n)) return 2;
+    try {
+        if (argc < 3) { std::cerr << "usage: krawczyk_lj13 <xyz> <radius_exp>\n"; return 2; }
+        int n = 0;
+        std::vector<double> p;
+        if (!read_xyz(argv[1], p, n)) {
+            std::cerr << "REJECTED: Failed to parse XYZ file\n";
+            return 2;
+        }
+        if (n != 13) { 
+            std::cerr << "REJECTED: Prototype supports N=13 only\n"; 
+            return 2; 
+        }
+        
+        double rad = std::pow(10.0, -std::atof(argv[2]));
+        if (!gauge_transform(p, n)) {
+            std::cerr << "REJECTED: Gauge transform failed (collinear anchors?)\n";
+            return 2;
+        }
 
     auto idx = slice_indices(n);
     int m = (int)idx.size();
@@ -431,12 +442,22 @@ int main(int argc, char** argv) {
     std::cout << "[energy] E in [" << arb_lo_floor(eX) << ", " << arb_hi_ceil(eX) << "]\n";
     std::cout << "[min_dist] lower bound=" << dmin << "\n";
 
-    if (dmin <= 0.0) {
-        std::cout << "STATUS: REJECTED (collision inside box)\n";
-    } else if (incl && kappa < 1.0 && pd) {
-        std::cout << "STATUS: CERTIFIED_STRICT_LOCAL_MINIMUM\n";
-    } else {
-        std::cout << "STATUS: INCONCLUSIVE\n";
+        if (dmin <= 0.0) {
+            std::cout << "STATUS: REJECTED (collision inside box)\n";
+        } else if (incl && kappa < 1.0 && pd) {
+            std::cout << "STATUS: CERTIFIED_STRICT_LOCAL_MINIMUM\n";
+        } else {
+            std::cout << "STATUS: INCONCLUSIVE\n";
+        }
+        return 0;
+
+    } catch (const std::exception& e) {
+        // Перехватываем любые runtime_error (например, "Atoms overlapping") 
+        // и превращаем их в штатный отказ, а не в краш (SIGABRT)
+        std::cerr << "REJECTED: " << e.what() << "\n";
+        return 2;
+    } catch (...) {
+        std::cerr << "REJECTED: Unknown internal error\n";
+        return 2;
     }
-    return 0;
 }
