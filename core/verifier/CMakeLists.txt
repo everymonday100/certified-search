@@ -9,7 +9,7 @@ find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
     message(STATUS "OpenMP found: version=${OpenMP_CXX_VERSION}, flags=${OpenMP_CXX_FLAGS}")
 else()
-    message(WARNING "OpenMP not found; krawczyk_lj38_batch will compile without parallelism")
+    message(WARNING "OpenMP not found; batch verifiers will compile without parallelism")
 endif()
 
 # Core library
@@ -35,14 +35,21 @@ if(FLINT_LIB AND MPFI_LIB AND MPFR_LIB AND GMP_LIB)
     add_executable(krawczyk_lj38 src/krawczyk_lj38.cpp)
     target_link_libraries(krawczyk_lj38 verifier_core ${FLINT_LIB} ${MPFR_LIB} ${GMP_LIB})
     
-    # Batch verifier with OpenMP parallelization
+    # Batch verifier (original, unoptimized baseline)
     add_executable(krawczyk_lj38_batch src/krawczyk_lj38_batch.cpp)
     target_link_libraries(krawczyk_lj38_batch verifier_core ${FLINT_LIB} ${MPFR_LIB} ${GMP_LIB})
     if(OpenMP_CXX_FOUND)
         target_link_libraries(krawczyk_lj38_batch OpenMP::OpenMP_CXX)
     endif()
-    # <filesystem> support (usually automatic in C++17 with GCC 9+, but explicit for safety)
     target_link_libraries(krawczyk_lj38_batch stdc++fs)
+    
+    # Optimized batch verifier (thread pooling, async I/O, capped threads)
+    add_executable(krawczyk_lj38_batch_opt src/krawczyk_lj38_batch_opt.cpp)
+    target_link_libraries(krawczyk_lj38_batch_opt verifier_core ${FLINT_LIB} ${MPFR_LIB} ${GMP_LIB})
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(krawczyk_lj38_batch_opt OpenMP::OpenMP_CXX)
+    endif()
+    target_link_libraries(krawczyk_lj38_batch_opt stdc++fs)
     
     message(STATUS "Interval libraries found: FLINT=${FLINT_LIB}, MPFI=${MPFI_LIB}")
 else()

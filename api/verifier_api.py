@@ -132,17 +132,21 @@ async def verify_batch(files: List[UploadFile] = File(...), radius_exponent: int
     if len(files) > 100:
         raise HTTPException(status_code=400, detail="Максимум 100 файлов за один запрос")
     
-    # Создаём временную директорию для файлов
     import tempfile
     import shutil
     
+    # Сохраняем содержимое файлов ДО выхода из контекста
+    file_contents = []
+    for i, file in enumerate(files):
+        content = await file.read()
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=413, detail=f"Файл {file.filename} слишком большой")
+        file_contents.append((f"config_{i:04d}.xyz", content))
+    
     with tempfile.TemporaryDirectory() as tmpdir:
-        for i, file in enumerate(files):
-            content = await file.read()
-            if len(content) > MAX_FILE_SIZE:
-                raise HTTPException(status_code=413, detail=f"Файл {file.filename} слишком большой")
-            
-            filepath = Path(tmpdir) / f"config_{i:04d}.xyz"
+        # Записываем файлы во временную директорию
+        for filename, content in file_contents:
+            filepath = Path(tmpdir) / filename
             filepath.write_bytes(content)
         
         # Запускаем батчевый верификатор
@@ -161,30 +165,39 @@ async def verify_batch(files: List[UploadFile] = File(...), radius_exponent: int
             batch_results = json.loads(result.stdout)
         except json.JSONDecodeError:
             raise HTTPException(status_code=500, detail="Не удалось распарсить результат верификатора")
+    
+    # ЗАПИСЬ В LEDGER (теперь ВНУТРИ контекста, файлы ещё существуют)
+    # Создаём временный словарь filename -> content
+    content_map = {filename: content for filename, content in file_contents}
+    
+    for r in batch_results.get("results", []):
+        # Извлекаем имя файла из полного пути
+        filename = Path(r["file"]).name
+        content = content_map.get(filename, b"")
+        config_hash = compute_file_hash(content)
         
-        # Записываем в Ledger
-        for r in batch_results.get("results", []):
-            config_hash = compute_file_hash(Path(r["file"]).read_bytes())
-            LEDGER.add_attempt(
-                task_hash=f"sha256:api_batch_{config_hash[:16]}",
-                config_hash=config_hash,
-                status=r["status"],
-                witness_data={
-                    "batch_elapsed": batch_results["batch_elapsed_sec"],
-                    "num_threads": batch_results["num_threads"],
-                    "verification_time": r["elapsed_sec"]
-                }
-            )
-        
-        return {
-            "batch_elapsed_sec": batch_results["batch_elapsed_sec"],
-            "num_files": batch_results["num_files"],
-            "num_threads": batch_results["num_threads"],
-            "certified_count": batch_results["certified_count"],
-            "avg_time_per_file": batch_results["avg_time_per_file"],
-            "speedup_vs_sequential": 0.35 / batch_results["avg_time_per_file"],
-            "results": batch_results["results"]
-        }
+        LEDGER.add_attempt(
+            task_hash=f"sha256:api_batch_{config_hash[:16]}",
+            config_hash=config_hash,
+            status=r["status"],
+            witness_data={
+                "batch_elapsed": batch_results["batch_elapsed_sec"],
+                "num_threads": batch_results["num_threads"],
+                "verification_time": r["elapsed_sec"],
+                "filename": filename
+            }
+        )
+    
+    return {
+        "batch_elapsed_sec": batch_results["batch_elapsed_sec"],
+        "num_files": batch_results["num_files"],
+        "num_threads": batch_results["num_threads"],
+        "max_threads": batch_results.get("max_threads", 8),
+        "certified_count": batch_results["certified_count"],
+        "avg_time_per_file": batch_results["avg_time_per_file"],
+        "speedup_vs_sequential": 0.35 / max(batch_results["avg_time_per_file"], 1e-9),
+        "results": batch_results["results"]
+    }
 
 def run_verifier_binary(xyz_content: str, radius_exp: int) -> dict:
     """Запускает C++ верификатор и парсит вывод."""
