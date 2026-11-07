@@ -24,6 +24,9 @@ if(FLINT_LIB AND MPFI_LIB AND MPFR_LIB AND GMP_LIB)
     add_executable(krawczyk_lj13 src/krawczyk_lj13.cpp)
     target_link_libraries(krawczyk_lj13 verifier_core ${FLINT_LIB} ${MPFR_LIB} ${GMP_LIB})
     
+    add_executable(krawczyk_lj38 src/krawczyk_lj38.cpp)
+    target_link_libraries(krawczyk_lj38 verifier_core ${FLINT_LIB} ${MPFR_LIB} ${GMP_LIB})
+    
     message(STATUS "Interval libraries found: FLINT=${FLINT_LIB}, MPFI=${MPFI_LIB}")
 else()
     message(WARNING "Interval libraries not found, skipping spike targets")

@@ -1,0 +1,489 @@
+// Krawczyk certificate pipeline for LJ38 (Phase 4: Scaling).
+// Usage: krawczyk_lj38 <xyz_path> <radius_exponent>
+//
+// Ключевое отличие от LJ13:
+//   - PREC = 256 бит (вместо 128) для подавления interval blowup в матрицах 114x114
+//   - Размерность задачи: 3N-6 = 108 внутренних степеней свободы
+//   - Интервальный гессиан: 114x114 (внутренний срез 108x108)
+#include <flint/arb.h>
+#include <flint/arf.h>
+
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "lj_potential.h"
+
+// КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: 256 бит для борьбы с interval blowup
+static const slong PREC = 256;
+
+// ---- rigorous double extraction helpers ----
+static double arb_lo_floor(const arb_t x) {
+    arf_t t; arf_init(t);
+    arb_get_lbound_arf(t, x, PREC);
+    double d = arf_get_d(t, ARF_RND_FLOOR);
+    arf_clear(t);
+    return d;
+}
+static double arb_hi_ceil(const arb_t x) {
+    arf_t t; arf_init(t);
+    arb_get_ubound_arf(t, x, PREC);
+    double d = arf_get_d(t, ARF_RND_CEIL);
+    arf_clear(t);
+    return d;
+}
+static double arb_lo_ceil(const arb_t x) {
+    arf_t t; arf_init(t);
+    arb_get_lbound_arf(t, x, PREC);
+    double d = arf_get_d(t, ARF_RND_CEIL);
+    arf_clear(t);
+    return d;
+}
+static double arb_hi_floor(const arb_t x) {
+    arf_t t; arf_init(t);
+    arb_get_ubound_arf(t, x, PREC);
+    double d = arf_get_d(t, ARF_RND_FLOOR);
+    arf_clear(t);
+    return d;
+}
+
+// ---- xyz parsing ----
+static bool read_xyz(const std::string& path, std::vector<double>& coords, int& n) {
+    std::ifstream f(path);
+    if (!f) { std::cerr << "cannot open " << path << "\n"; return false; }
+    std::string line;
+    if (!std::getline(f, line)) return false;
+    n = std::atoi(line.c_str());
+    if (n <= 0) return false;
+    std::getline(f, line);  // comment
+    coords.clear();
+    for (int i = 0; i < n; ++i) {
+        if (!std::getline(f, line)) return false;
+        std::istringstream ss(line);
+        std::string el; double x, y, z;
+        if (!(ss >> el >> x >> y >> z)) return false;
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
+        coords.push_back(x); coords.push_back(y); coords.push_back(z);
+    }
+    return true;
+}
+
+// ---- gauge: atom0 at origin, atom1 on +X, atom2 in XY plane (y>0) ----
+static bool gauge_transform(std::vector<double>& p, int n) {
+    double p0[3] = {p[0], p[1], p[2]};
+    for (int i = 0; i < n; ++i) { p[3*i] -= p0[0]; p[3*i+1] -= p0[1]; p[3*i+2] -= p0[2]; }
+    double a[3] = {p[3], p[4], p[5]};
+    double na = std::sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+    if (na < 1e-8) return false;
+    double e1[3] = {a[0]/na, a[1]/na, a[2]/na};
+    double b[3] = {p[6], p[7], p[8]};
+    double bd = b[0]*e1[0] + b[1]*e1[1] + b[2]*e1[2];
+    double bp[3] = {b[0]-bd*e1[0], b[1]-bd*e1[1], b[2]-bd*e1[2]};
+    double nbp = std::sqrt(bp[0]*bp[0] + bp[1]*bp[1] + bp[2]*bp[2]);
+    if (nbp < 1e-8) { std::cerr << "collinear anchors\n"; return false; }
+    double e2[3] = {bp[0]/nbp, bp[1]/nbp, bp[2]/nbp};
+    double e3[3] = {e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]};
+    std::vector<double> q(3*n);
+    for (int i = 0; i < n; ++i) {
+        double v[3] = {p[3*i], p[3*i+1], p[3*i+2]};
+        q[3*i]   = v[0]*e1[0] + v[1]*e1[1] + v[2]*e1[2];
+        q[3*i+1] = v[0]*e2[0] + v[1]*e2[1] + v[2]*e2[2];
+        q[3*i+2] = v[0]*e3[0] + v[1]*e3[1] + v[2]*e3[2];
+    }
+    p = q;
+    return true;
+}
+
+static std::vector<int> slice_indices(int n) {
+    std::vector<int> idx;
+    idx.push_back(3);  // x1 only (y1=0, z1=0 fixed by gauge)
+    idx.push_back(6);  // x2
+    idx.push_back(7);  // y2 (z2=0 fixed by gauge)
+    for (int i = 3; i < n; ++i) { idx.push_back(3*i); idx.push_back(3*i+1); idx.push_back(3*i+2); }
+    return idx;  // size 1 + 2 + (n-3)*3 = 3N-6
+}
+
+static void full_from_q(const std::vector<double>& q0, int n, std::vector<double>& full) {
+    full.assign(3*n, 0.0);
+    full[3] = q0[0];  // x1
+    full[6] = q0[1];  // x2
+    full[7] = q0[2];  // y2
+    for (int i = 3; i < n; ++i)
+        for (int c = 0; c < 3; ++c) full[3*i+c] = q0[3 + 3*(i-3) + c];
+}
+
+// ---- float64 linear algebra (preconditioner / Newton only; NOT proof-bearing) ----
+static bool solve_lin(std::vector<double> A, std::vector<double> b, std::vector<double>& x, int m) {
+    for (int k = 0; k < m; ++k) {
+        int piv = k; double best = std::fabs(A[k*m+k]);
+        for (int r = k+1; r < m; ++r) { double v = std::fabs(A[r*m+k]); if (v > best) { best = v; piv = r; } }
+        if (best < 1e-14) return false;
+        if (piv != k) { for (int c = 0; c < m; ++c) std::swap(A[k*m+c], A[piv*m+c]); std::swap(b[k], b[piv]); }
+        for (int r = k+1; r < m; ++r) {
+            double f = A[r*m+k] / A[k*m+k];
+            if (f == 0.0) continue;
+            for (int c = k; c < m; ++c) A[r*m+c] -= f * A[k*m+c];
+            b[r] -= f * b[k];
+        }
+    }
+    x.assign(m, 0.0);
+    for (int r = m-1; r >= 0; --r) {
+        double s = b[r];
+        for (int c = r+1; c < m; ++c) s -= A[r*m+c] * x[c];
+        x[r] = s / A[r*m+r];
+    }
+    return true;
+}
+
+static bool invert_mat(const std::vector<double>& A0, std::vector<double>& Ainv, int m) {
+    Ainv.assign(m*m, 0.0);
+    for (int j = 0; j < m; ++j) {
+        std::vector<double> e(m, 0.0), x;
+        e[j] = 1.0;
+        if (!solve_lin(A0, e, x, m)) return false;
+        for (int r = 0; r < m; ++r) Ainv[r*m+j] = x[r];
+    }
+    return true;
+}
+
+// ---- interval LJ gradient / Hessian / energy / min distance ----
+static void lj_interval_grad_hess(const std::vector<arb_t>& cart, int n,
+                                  std::vector<arb_t>& grad, std::vector<arb_t>& hess,
+                                  arb_t eout, double* dmin_lb) {
+    arb_t dx, dy, dz, r2, i1, i2, i4, i5, i6, i7, i8, r6i, t1, t2, A, B, val;
+    arb_t c4, cm12, c6, c168, cm48, zb, ob;
+    arb_init(dx); arb_init(dy); arb_init(dz); arb_init(r2);
+    arb_init(i1); arb_init(i2); arb_init(i4); arb_init(i5); arb_init(i6);
+    arb_init(i7); arb_init(i8); arb_init(r6i);
+    arb_init(t1); arb_init(t2); arb_init(A); arb_init(B); arb_init(val);
+    arb_init(c4); arb_init(cm12); arb_init(c6); arb_init(c168); arb_init(cm48);
+    arb_init(zb); arb_init(ob);
+    arb_set_d(c4, 4.0); arb_set_d(cm12, -12.0); arb_set_d(c6, 6.0);
+    arb_set_d(c168, 168.0); arb_set_d(cm48, -48.0);
+    arb_set_d(zb, 0.0); arb_set_d(ob, 1.0);
+
+    for (int i = 0; i < n; ++i) {
+        for (int j = i+1; j < n; ++j) {
+            arb_sub(dx, cart[3*i],   cart[3*j],   PREC);
+            arb_sub(dy, cart[3*i+1], cart[3*j+1], PREC);
+            arb_sub(dz, cart[3*i+2], cart[3*j+2], PREC);
+            arb_sqr(t1, dx, PREC); arb_sqr(t2, dy, PREC); arb_add(r2, t1, t2, PREC);
+            arb_sqr(t1, dz, PREC); arb_add(r2, r2, t1, PREC);
+
+            if (dmin_lb) {
+                double lo = arb_lo_floor(r2);
+                if (lo > 0.0) {
+                    double d = std::nextafter(std::sqrt(lo), -INFINITY);
+                    if (d < *dmin_lb) *dmin_lb = d;
+                } else {
+                    *dmin_lb = 0.0;
+                }
+            }
+
+            arb_inv(i1, r2, PREC);
+            arb_sqr(i2, i1, PREC);
+            arb_sqr(i4, i2, PREC);
+            arb_mul(i5, i4, i1, PREC);
+            arb_mul(i6, i4, i2, PREC);
+            arb_mul(i7, i6, i1, PREC);
+            arb_sqr(i8, i4, PREC);
+            arb_mul(r6i, i1, i2, PREC);
+
+            arb_mul(t1, i7, cm12, PREC);
+            arb_mul(t2, i4, c6, PREC);
+            arb_add(A, t1, t2, PREC);
+            arb_mul(A, A, c4, PREC);
+
+            arb_mul(t1, i8, c168, PREC);
+            arb_mul(t2, i5, cm48, PREC);
+            arb_add(B, t1, t2, PREC);
+            arb_mul(B, B, c4, PREC);
+
+            arb_t rr[3];
+            arb_init(rr[0]); arb_init(rr[1]); arb_init(rr[2]);
+            arb_set(rr[0], dx);
+            arb_set(rr[1], dy);
+            arb_set(rr[2], dz);
+
+            for (int c = 0; c < 3; ++c) {
+                arb_mul(val, A, rr[c], PREC);
+                arb_add(grad[3*i+c], grad[3*i+c], val, PREC);
+                arb_sub(grad[3*j+c], grad[3*j+c], val, PREC);
+            }
+            for (int a = 0; a < 3; ++a) {
+                for (int b = 0; b < 3; ++b) {
+                    arb_mul(val, rr[a], rr[b], PREC);
+                    arb_mul(val, val, i1, PREC);
+                    arb_mul(val, val, B, PREC);
+                    if (a == b) arb_add(val, val, A, PREC);
+                    arb_add(hess[(3*i+a)*(3*n) + (3*i+b)], hess[(3*i+a)*(3*n) + (3*i+b)], val, PREC);
+                    arb_add(hess[(3*j+a)*(3*n) + (3*j+b)], hess[(3*j+a)*(3*n) + (3*j+b)], val, PREC);
+                    arb_sub(hess[(3*i+a)*(3*n) + (3*j+b)], hess[(3*i+a)*(3*n) + (3*j+b)], val, PREC);
+                    arb_sub(hess[(3*j+a)*(3*n) + (3*i+b)], hess[(3*j+a)*(3*n) + (3*i+b)], val, PREC);
+                }
+            }
+
+            arb_clear(rr[0]); arb_clear(rr[1]); arb_clear(rr[2]);
+
+            arb_mul(t1, i6, c4, PREC);
+            arb_mul(t2, r6i, c4, PREC);
+            arb_sub(t1, t1, t2, PREC);
+            arb_add(eout, eout, t1, PREC);
+        }
+    }
+    arb_clear(dx); arb_clear(dy); arb_clear(dz); arb_clear(r2);
+    arb_clear(i1); arb_clear(i2); arb_clear(i4); arb_clear(i5); arb_clear(i6);
+    arb_clear(i7); arb_clear(i8); arb_clear(r6i);
+    arb_clear(t1); arb_clear(t2); arb_clear(A); arb_clear(B); arb_clear(val);
+    arb_clear(c4); arb_clear(cm12); arb_clear(c6); arb_clear(c168); arb_clear(cm48);
+    arb_clear(zb); arb_clear(ob);
+}
+
+int main(int argc, char** argv) {
+    try {
+        if (argc < 3) { std::cerr << "usage: krawczyk_lj38 <xyz> <radius_exp>\n"; return 2; }
+        int n = 0;
+        std::vector<double> p;
+        if (!read_xyz(argv[1], p, n)) {
+            std::cerr << "REJECTED: Failed to parse XYZ file\n";
+            return 2;
+        }
+        if (n != 38) {
+            std::cerr << "REJECTED: This verifier is strictly for N=38 (got N=" << n << ")\n";
+            return 2;
+        }
+
+        double rad = std::pow(10.0, -std::atof(argv[2]));
+        if (!gauge_transform(p, n)) {
+            std::cerr << "REJECTED: Gauge transform failed (collinear anchors?)\n";
+            return 2;
+        }
+
+        auto idx = slice_indices(n);
+        int m = (int)idx.size();  // m = 3N-6 = 108 для N=38
+
+        std::vector<double> q0(m);
+        q0[0] = p[3];   // x1
+        q0[1] = p[6];   // x2
+        q0[2] = p[7];   // y2
+        for (int i = 3; i < n; ++i)
+            for (int c = 0; c < 3; ++c) q0[3 + 3*(i-3) + c] = p[3*i+c];
+
+        // float Newton refinement on the slice (not proof-bearing)
+        double ginf = 1e300;
+        for (int iter = 0; iter < 6; ++iter) {
+            std::vector<double> full;
+            full_from_q(q0, n, full);
+            LJResult r = compute_lj_exact(full);
+            std::vector<double> g(m), H(m*m);
+            for (int a = 0; a < m; ++a) {
+                g[a] = r.gradient[idx[a]];
+                for (int b = 0; b < m; ++b) H[a*m+b] = r.hessian[(size_t)idx[a]*(3*n) + idx[b]];
+            }
+            ginf = 0.0;
+            for (double x : g) ginf = std::max(ginf, std::fabs(x));
+            if (ginf < 1e-13) break;
+            std::vector<double> neg(m), d;
+            for (int a = 0; a < m; ++a) neg[a] = -g[a];
+            if (!solve_lin(H, neg, d, m)) { std::cerr << "REJECTED: singular Hessian in Newton\n"; return 2; }
+            for (int a = 0; a < m; ++a) q0[a] += d[a];
+        }
+        std::cout << "[newton] |grad|_inf after refine = " << ginf << "\n";
+
+        // ---- interval stage ----
+        mag_t radmag; mag_init(radmag); mag_set_d(radmag, rad);
+
+        std::vector<arb_t> qp(m), qX(m), cartp(3*n), cartX(3*n);
+        std::vector<arb_t> gradp(3*n), gradX(3*n), hessX(3*n*3*n);
+        for (int i = 0; i < m; ++i) {
+            arb_init(qp[i]); arb_init(qX[i]);
+            arb_set_d(qp[i], q0[i]);
+            arb_set_d(qX[i], q0[i]);
+            arb_add_error_mag(qX[i], radmag);
+        }
+        for (int i = 0; i < 3*n; ++i) { arb_init(cartp[i]); arb_init(cartX[i]); arb_init(gradp[i]); arb_init(gradX[i]); }
+        for (size_t i = 0; i < hessX.size(); ++i) arb_init(hessX[i]);
+
+        // point carts
+        arb_set_d(cartp[0], 0.0); arb_set_d(cartp[1], 0.0); arb_set_d(cartp[2], 0.0);
+        arb_set(cartp[3], qp[0]); arb_set_d(cartp[4], 0.0); arb_set_d(cartp[5], 0.0);
+        arb_set(cartp[6], qp[1]); arb_set(cartp[7], qp[2]); arb_set_d(cartp[8], 0.0);
+        for (int i = 3; i < n; ++i) for (int c = 0; c < 3; ++c) arb_set(cartp[3*i+c], qp[3+3*(i-3)+c]);
+        // box carts
+        arb_set_d(cartX[0], 0.0); arb_set_d(cartX[1], 0.0); arb_set_d(cartX[2], 0.0);
+        arb_set(cartX[3], qX[0]); arb_set_d(cartX[4], 0.0); arb_set_d(cartX[5], 0.0);
+        arb_set(cartX[6], qX[1]); arb_set(cartX[7], qX[2]); arb_set_d(cartX[8], 0.0);
+        for (int i = 3; i < n; ++i) for (int c = 0; c < 3; ++c) arb_set(cartX[3*i+c], qX[3+3*(i-3)+c]);
+
+        arb_t ep, eX;
+        arb_init(ep); arb_init(eX);
+        arb_set_d(ep, 0.0); arb_set_d(eX, 0.0);
+        double dmin = 1e300;
+        lj_interval_grad_hess(cartp, n, gradp, hessX, ep, nullptr);
+        for (size_t i = 0; i < hessX.size(); ++i) arb_set_d(hessX[i], 0.0);
+        lj_interval_grad_hess(cartX, n, gradX, hessX, eX, &dmin);
+
+        // select F0 and H(X)
+        std::vector<arb_t> F0(m), HX(m*m);
+        for (int i = 0; i < m; ++i) arb_init(F0[i]);
+        for (int i = 0; i < m*m; ++i) arb_init(HX[i]);
+        for (int a = 0; a < m; ++a) arb_set(F0[a], gradp[idx[a]]);
+        for (int a = 0; a < m; ++a)
+            for (int b = 0; b < m; ++b) arb_set(HX[a*m+b], hessX[(size_t)idx[a]*(3*n) + idx[b]]);
+
+        // preconditioner C = inv(mid Hessian at q0) (float, not proof-bearing)
+        std::vector<double> full;
+        full_from_q(q0, n, full);
+        LJResult rf = compute_lj_exact(full);
+        std::vector<double> Hsel(m*m), C;
+        for (int a = 0; a < m; ++a)
+            for (int b = 0; b < m; ++b) Hsel[a*m+b] = rf.hessian[(size_t)idx[a]*(3*n) + idx[b]];
+        if (!invert_mat(Hsel, C, m)) { std::cerr << "REJECTED: preconditioner inversion failed\n"; return 2; }
+
+        // M = I - C*H(X)
+        std::vector<arb_t> M(m*m);
+        for (int i = 0; i < m*m; ++i) arb_init(M[i]);
+        {
+            arb_t acc, t, cb2, db;
+            arb_init(acc); arb_init(t); arb_init(cb2); arb_init(db);
+            for (int i = 0; i < m; ++i) {
+                for (int j = 0; j < m; ++j) {
+                    arb_set_d(acc, 0.0);
+                    for (int k = 0; k < m; ++k) {
+                        arb_set_d(cb2, C[i*m+k]);
+                        arb_mul(t, cb2, HX[k*m+j], PREC);
+                        arb_add(acc, acc, t, PREC);
+                    }
+                    arb_set_d(db, (i == j) ? 1.0 : 0.0);
+                    arb_sub(M[i*m+j], db, acc, PREC);
+                }
+            }
+            arb_clear(acc); arb_clear(t); arb_clear(cb2); arb_clear(db);
+        }
+
+        // kappa = ||M||_inf upper bound
+        double kappa = 0.0;
+        {
+            arb_t S, t;
+            arb_init(S); arb_init(t);
+            for (int i = 0; i < m; ++i) {
+                arb_set_d(S, 0.0);
+                for (int j = 0; j < m; ++j) {
+                    arb_abs(t, M[i*m+j]);
+                    arb_add(S, S, t, PREC);
+                }
+                kappa = std::max(kappa, arb_hi_ceil(S));
+            }
+            arb_clear(S); arb_clear(t);
+        }
+
+        // K = q0 - C*F0 + M*(X - q0)
+        std::vector<arb_t> K(m), V(m);
+        for (int i = 0; i < m; ++i) { arb_init(K[i]); arb_init(V[i]); arb_set_d(V[i], 0.0); arb_add_error_mag(V[i], radmag); }
+        {
+            arb_t t, cb2, cf;
+            arb_init(t); arb_init(cb2); arb_init(cf);
+            for (int i = 0; i < m; ++i) {
+                arb_set_d(K[i], q0[i]);
+                arb_set_d(cf, 0.0);
+                for (int k = 0; k < m; ++k) {
+                    arb_set_d(cb2, C[i*m+k]);
+                    arb_mul(t, cb2, F0[k], PREC);
+                    arb_add(cf, cf, t, PREC);
+                }
+                arb_sub(K[i], K[i], cf, PREC);
+                for (int j = 0; j < m; ++j) {
+                    arb_mul(t, M[i*m+j], V[j], PREC);
+                    arb_add(K[i], K[i], t, PREC);
+                }
+            }
+            arb_clear(t); arb_clear(cb2); arb_clear(cf);
+        }
+
+        // inclusion K ⊂ int(X)
+        bool incl = true;
+        int incl_fail_index = -1;
+        for (int i = 0; i < m && incl; ++i) {
+            double klo = arb_lo_floor(K[i]), khi = arb_hi_ceil(K[i]);
+            double xlo = arb_lo_ceil(qX[i]), xhi = arb_hi_floor(qX[i]);
+            if (!(klo > xlo) || !(khi < xhi)) { incl = false; incl_fail_index = i; }
+        }
+
+        // interval Cholesky => PD for all H in H(X)
+        bool pd = true;
+        double pd_lb = 1e300;
+        int pd_fail_index = -1;
+        std::vector<arb_t> L(m*m);
+        for (int i = 0; i < m*m; ++i) { arb_init(L[i]); arb_set_d(L[i], 0.0); }
+        for (int k = 0; k < m && pd; ++k) {
+            arb_t s; arb_init(s); arb_set_d(s, 0.0);
+            for (int j = 0; j < k; ++j) {
+                arb_t t; arb_init(t);
+                arb_sqr(t, L[k*m+j], PREC);
+                arb_sub(s, s, t, PREC);
+                arb_clear(t);
+            }
+            arb_add(s, s, HX[k*m+k], PREC);
+            arb_sqrt(L[k*m+k], s, PREC);
+            if (!arb_is_finite(L[k*m+k])) { pd = false; pd_fail_index = k; }
+            else {
+                double lb = arb_lo_floor(L[k*m+k]);
+                if (!(lb > 0.0)) { pd = false; pd_fail_index = k; }
+                else pd_lb = std::min(pd_lb, lb);
+            }
+            arb_clear(s);
+            for (int i = k+1; i < m && pd; ++i) {
+                arb_t s2; arb_init(s2); arb_set_d(s2, 0.0);
+                for (int j = 0; j < k; ++j) {
+                    arb_t t; arb_init(t);
+                    arb_mul(t, L[i*m+j], L[k*m+j], PREC);
+                    arb_sub(s2, s2, t, PREC);
+                    arb_clear(t);
+                }
+                arb_add(s2, s2, HX[i*m+k], PREC);
+                arb_div(L[i*m+k], s2, L[k*m+k], PREC);
+                arb_clear(s2);
+            }
+        }
+
+        std::cout << "[krawczyk] radius=" << rad
+                  << "  inclusion=" << (incl ? "OK" : "FAIL")
+                  << "  kappa_ub=" << kappa << (kappa < 1.0 ? " <1 OK" : " >=1 FAIL") << "\n";
+        std::cout << "[pd] interval Cholesky: " << (pd ? "OK" : "FAIL")
+                  << "  min diagonal lower bound=" << pd_lb << "\n";
+        std::cout << "[energy] E in [" << arb_lo_floor(eX) << ", " << arb_hi_ceil(eX) << "]\n";
+        std::cout << "[min_dist] lower bound=" << dmin << "\n";
+
+        if (dmin <= 0.0) {
+            std::cout << "STATUS: REJECTED (collision inside box)\n";
+        } else if (incl && kappa < 1.0 && pd) {
+            std::cout << "STATUS: CERTIFIED_STRICT_LOCAL_MINIMUM\n";
+        } else {
+            std::cout << "STATUS: INCONCLUSIVE\n";
+            // Diagnostic output for LJ38 scaling debugging
+            if (!pd) {
+                std::cout << "DEBUG: interval Cholesky failed at diagonal index " << pd_fail_index
+                          << " (likely interval blowup or ill-conditioned Hessian block)\n";
+                std::cout << "DEBUG: min diagonal lb = " << pd_lb << "\n";
+            }
+            if (!incl) {
+                std::cout << "DEBUG: inclusion K ⊂ int(X) failed at index " << incl_fail_index << "\n";
+            }
+            if (kappa >= 1.0) {
+                std::cout << "DEBUG: contraction condition failed, kappa_ub = " << kappa << "\n";
+            }
+        }
+        return 0;
+
+    } catch (const std::exception& e) {
+        std::cerr << "REJECTED: " << e.what() << "\n";
+        return 2;
+    } catch (...) {
+        std::cerr << "REJECTED: Unknown internal error\n";
+        return 2;
+    }
+}
