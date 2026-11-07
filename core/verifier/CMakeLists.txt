@@ -4,6 +4,14 @@ project(CertifiedSearchVerifier CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+# Find OpenMP for parallel batch verification
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    message(STATUS "OpenMP found: version=${OpenMP_CXX_VERSION}, flags=${OpenMP_CXX_FLAGS}")
+else()
+    message(WARNING "OpenMP not found; krawczyk_lj38_batch will compile without parallelism")
+endif()
+
 # Core library
 add_library(verifier_core src/lj_potential.cpp)
 target_include_directories(verifier_core PUBLIC src)
@@ -26,6 +34,15 @@ if(FLINT_LIB AND MPFI_LIB AND MPFR_LIB AND GMP_LIB)
     
     add_executable(krawczyk_lj38 src/krawczyk_lj38.cpp)
     target_link_libraries(krawczyk_lj38 verifier_core ${FLINT_LIB} ${MPFR_LIB} ${GMP_LIB})
+    
+    # Batch verifier with OpenMP parallelization
+    add_executable(krawczyk_lj38_batch src/krawczyk_lj38_batch.cpp)
+    target_link_libraries(krawczyk_lj38_batch verifier_core ${FLINT_LIB} ${MPFR_LIB} ${GMP_LIB})
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(krawczyk_lj38_batch OpenMP::OpenMP_CXX)
+    endif()
+    # <filesystem> support (usually automatic in C++17 with GCC 9+, but explicit for safety)
+    target_link_libraries(krawczyk_lj38_batch stdc++fs)
     
     message(STATUS "Interval libraries found: FLINT=${FLINT_LIB}, MPFI=${MPFI_LIB}")
 else()
