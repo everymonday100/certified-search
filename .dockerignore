@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+.env
+.git
+.gitignore
+*.md
+docs/
+tests/
+core/verifier/build/
+*.db
+*.json
+!reference/
