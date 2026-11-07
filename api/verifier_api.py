@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import os
 from pathlib import Path
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
@@ -121,6 +121,70 @@ def validate_xyz_content(content: str) -> tuple[int, list[list[float]]]:
         coordinates.append([x, y, z])
     
     return n_atoms, coordinates
+
+# Добавьте этот код в api/verifier_api.py перед блоком "Запуск"
+
+@app.post("/verify-batch")
+async def verify_batch(files: List[UploadFile] = File(...), radius_exponent: int = Form(8)):
+    """
+    Пакетная верификация нескольких XYZ-файлов с параллельной обработкой.
+    """
+    if len(files) > 100:
+        raise HTTPException(status_code=400, detail="Максимум 100 файлов за один запрос")
+    
+    # Создаём временную директорию для файлов
+    import tempfile
+    import shutil
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i, file in enumerate(files):
+            content = await file.read()
+            if len(content) > MAX_FILE_SIZE:
+                raise HTTPException(status_code=413, detail=f"Файл {file.filename} слишком большой")
+            
+            filepath = Path(tmpdir) / f"config_{i:04d}.xyz"
+            filepath.write_bytes(content)
+        
+        # Запускаем батчевый верификатор
+        start = time.perf_counter()
+        result = subprocess.run(
+            ["./core/verifier/build/krawczyk_lj38_batch", tmpdir, str(radius_exponent)],
+            capture_output=True, text=True, timeout=300
+        )
+        elapsed = time.perf_counter() - start
+        
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"Верификатор упал: {result.stderr}")
+        
+        # Парсим JSON-результат
+        try:
+            batch_results = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=500, detail="Не удалось распарсить результат верификатора")
+        
+        # Записываем в Ledger
+        for r in batch_results.get("results", []):
+            config_hash = compute_file_hash(Path(r["file"]).read_bytes())
+            LEDGER.add_attempt(
+                task_hash=f"sha256:api_batch_{config_hash[:16]}",
+                config_hash=config_hash,
+                status=r["status"],
+                witness_data={
+                    "batch_elapsed": batch_results["batch_elapsed_sec"],
+                    "num_threads": batch_results["num_threads"],
+                    "verification_time": r["elapsed_sec"]
+                }
+            )
+        
+        return {
+            "batch_elapsed_sec": batch_results["batch_elapsed_sec"],
+            "num_files": batch_results["num_files"],
+            "num_threads": batch_results["num_threads"],
+            "certified_count": batch_results["certified_count"],
+            "avg_time_per_file": batch_results["avg_time_per_file"],
+            "speedup_vs_sequential": 0.35 / batch_results["avg_time_per_file"],
+            "results": batch_results["results"]
+        }
 
 def run_verifier_binary(xyz_content: str, radius_exp: int) -> dict:
     """Запускает C++ верификатор и парсит вывод."""
